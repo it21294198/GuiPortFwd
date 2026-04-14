@@ -2,7 +2,11 @@
 #### Simple GUI based Port Forwarding tool for developers
 #### This project aims to Forward a Port which is running on a local Windows machine.
 #####   This can be easily access via LAN router within the same network which Access devices ans machine on. (Built with Claude)
-#### Run this on PowerShell (if there is an issue, run on Powershell as run as administrator)
+[Image1](/gui1.png)
+Before Started
+[Image2](/gui2.png)
+After Started
+### Run this on PowerShell (if there is an issue, run on Powershell as run as administrator)
 ```sh
 cargo run
 ```
