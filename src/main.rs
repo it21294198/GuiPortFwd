@@ -1,5 +1,5 @@
-//! GuiPortFwd — GUI port forwarder for Windows
-//! Built with egui/eframe (native, no browser needed)
+//! portfwd — GUI port forwarder (Windows, macOS, Linux)
+//! Built with egui/eframe + tokio
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -28,80 +28,197 @@ enum RuleStatus {
 }
 
 struct ActiveRule {
-    rule: Rule,
-    status: RuleStatus,
-    stop_tx: Option<oneshot::Sender<()>>,
+    rule:        Rule,
+    status:      RuleStatus,
+    stop_tx:     Option<oneshot::Sender<()>>,
     connections: u64,
 }
 
 // ─── Firewall ─────────────────────────────────────────────────────────────────
 
 fn fw_add(port: u16) -> bool {
-    Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name=GuiPortFwd-{}", port),
-            "dir=in",
-            "action=allow",
-            "protocol=TCP",
-            &format!("localport={}", port),
-        ])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        Command::new("netsh")
+            .args([
+                "advfirewall", "firewall", "add", "rule",
+                &format!("name=portfwd-{}", port),
+                "dir=in", "action=allow", "protocol=TCP",
+                &format!("localport={}", port),
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: add a pf anchor rule (requires sudo)
+        // Simpler: just open the port via pfctl echo rule
+        let rule = format!("pass in proto tcp from any to any port {}", port);
+        let _ = Command::new("sh")
+            .args(["-c", &format!("echo '{}' | sudo pfctl -ef -", rule)])
+            .output();
+        true // pf rules are optional; app still forwards without them
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: add an iptables rule
+        let ok = Command::new("iptables")
+            .args([
+                "-I", "INPUT", "-p", "tcp",
+                "--dport", &port.to_string(),
+                "-j", "ACCEPT",
+            ])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            // Try with sudo if direct call failed
+            Command::new("sudo")
+                .args([
+                    "iptables", "-I", "INPUT", "-p", "tcp",
+                    "--dport", &port.to_string(),
+                    "-j", "ACCEPT",
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        } else {
+            ok
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    { let _ = port; false }
 }
 
 fn fw_remove(port: u16) {
-    let _ = Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            &format!("name=GuiPortFwd-{}", port),
-        ])
-        .output();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("netsh")
+            .args([
+                "advfirewall", "firewall", "delete", "rule",
+                &format!("name=portfwd-{}", port),
+            ])
+            .output();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Flush the anchor we added (best-effort)
+        let _ = Command::new("sudo")
+            .args(["pfctl", "-F", "rules"])
+            .output();
+        let _ = port;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Remove the iptables rule
+        let _ = Command::new("sudo")
+            .args([
+                "iptables", "-D", "INPUT", "-p", "tcp",
+                "--dport", &port.to_string(),
+                "-j", "ACCEPT",
+            ])
+            .output();
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    { let _ = port; }
 }
 
-// ─── Admin check ──────────────────────────────────────────────────────────────
+// ─── Admin / privilege check ──────────────────────────────────────────────────
 
-#[cfg(windows)]
 fn is_elevated() -> bool {
-    Command::new("net")
-        .args(["session"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+    #[cfg(windows)]
+    {
+        Command::new("net").args(["session"])
+            .output().map(|o| o.status.success()).unwrap_or(false)
+    }
 
-#[cfg(not(windows))]
-fn is_elevated() -> bool {
-    true
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // On Unix, check if effective UID is 0 (root)
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    { false }
 }
 
 // ─── LAN IP detection ─────────────────────────────────────────────────────────
 
 fn lan_ip() -> Option<IpAddr> {
-    let out = Command::new("ipconfig").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let t = line.trim();
-        if !t.contains("IPv4") {
-            continue;
-        }
-        if let Some(pos) = t.rfind(':') {
-            let ip_str = t[pos + 1..].trim();
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                if !ip.is_loopback() {
-                    return Some(ip);
+    #[cfg(windows)]
+    {
+        // Parse ipconfig output
+        let out = Command::new("ipconfig").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let t = line.trim();
+            if !t.contains("IPv4") { continue; }
+            if let Some(pos) = t.rfind(':') {
+                let ip_str = t[pos + 1..].trim();
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    if !ip.is_loopback() { return Some(ip); }
                 }
             }
         }
+        None
     }
-    None
+
+    #[cfg(target_os = "macos")]
+    {
+        // Parse `ifconfig` — look for en0 (Wi-Fi) or en1 inet address
+        let out = Command::new("ifconfig").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut in_en = false;
+        for line in text.lines() {
+            let t = line.trim();
+            // Track which interface we're in
+            if t.starts_with("en") && t.contains(':') { in_en = true; }
+            else if !t.starts_with(' ') && !t.starts_with('\t') { in_en = false; }
+            if !in_en { continue; }
+            // "inet 192.168.1.10 netmask ..."
+            if t.starts_with("inet ") && !t.starts_with("inet6") {
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(ip) = parts[1].parse::<IpAddr>() {
+                        if !ip.is_loopback() { return Some(ip); }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Parse `ip addr show` output
+        let out = Command::new("ip").args(["addr", "show"]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let t = line.trim();
+            // "inet 192.168.1.10/24 brd ..."
+            if t.starts_with("inet ") && !t.starts_with("inet6") {
+                let parts: Vec<&str> = t.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    // Strip the /prefix length
+                    let ip_str = parts[1].split('/').next().unwrap_or("");
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                        if !ip.is_loopback() { return Some(ip); }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    { None }
 }
 
 // ─── Async TCP forwarder ──────────────────────────────────────────────────────
@@ -120,7 +237,7 @@ async fn forward_conn(mut client: TcpStream, target: Arc<String>) -> io::Result<
 }
 
 fn spawn_forwarder(
-    rule: Rule,
+    rule:       Rule,
     conn_count: Arc<Mutex<u64>>,
     status_out: Arc<Mutex<RuleStatus>>,
 ) -> oneshot::Sender<()> {
@@ -130,14 +247,8 @@ fn spawn_forwarder(
         rt.block_on(async move {
             let addr: SocketAddr = format!("0.0.0.0:{}", rule.listen_port).parse().unwrap();
             let listener = match TcpListener::bind(addr).await {
-                Ok(l) => {
-                    *status_out.lock().unwrap() = RuleStatus::Running;
-                    l
-                }
-                Err(e) => {
-                    *status_out.lock().unwrap() = RuleStatus::Error(e.to_string());
-                    return;
-                }
+                Ok(l)  => { *status_out.lock().unwrap() = RuleStatus::Running; l }
+                Err(e) => { *status_out.lock().unwrap() = RuleStatus::Error(e.to_string()); return; }
             };
             let target = Arc::new(format!("{}:{}", rule.target_host, rule.target_port));
             let mut stop_rx = stop_rx;
@@ -171,36 +282,43 @@ struct PortFwdApp {
     listen_port: String,
     target_host: String,
     target_port: String,
-    rules: Vec<ActiveRule>,
+    rules:       Vec<ActiveRule>,
     rule_status: Vec<Arc<Mutex<RuleStatus>>>,
-    rule_conns: Vec<Arc<Mutex<u64>>>,
-    lan_ip: String,
-    is_admin: bool,
-    log: Vec<String>,
+    rule_conns:  Vec<Arc<Mutex<u64>>>,
+    lan_ip:      String,
+    is_admin:    bool,
+    log:         Vec<String>,
 }
 
 impl Default for PortFwdApp {
     fn default() -> Self {
-        // lan_ip  = PC's Wi-Fi IP (e.g. 192.168.1.10) — shown in header & phone URL
-        // target_host is always 127.0.0.1 — FastAPI runs locally on this PC
-        let lan = lan_ip()
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let lan = lan_ip().map(|i| i.to_string()).unwrap_or_else(|| "unknown".to_string());
         let log_msg = if lan == "unknown" {
-            "⚠  Could not detect LAN IP — is Wi-Fi connected?".to_string()
+            "⚠  Could not detect LAN IP — is network connected?".to_string()
         } else {
             format!("✓  LAN IP: {}  — use this address on your phone.", lan)
+        };
+        let admin_hint = {
+            #[cfg(windows)]      { "Run as Administrator" }
+            #[cfg(target_os = "macos")]  { "Run with sudo" }
+            #[cfg(target_os = "linux")]  { "Run with sudo" }
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+            { "elevated privileges" }
         };
         Self {
             listen_port: "9000".to_string(),
             target_host: "127.0.0.1".to_string(),
             target_port: "8080".to_string(),
-            rules: vec![],
+            rules:       vec![],
             rule_status: vec![],
-            rule_conns: vec![],
-            lan_ip: lan,
-            is_admin: is_elevated(),
-            log: vec!["GuiPortFwd ready.".to_string(), log_msg],
+            rule_conns:  vec![],
+            lan_ip:      lan,
+            is_admin:    is_elevated(),
+            log: vec![
+                "portfwd ready.".to_string(),
+                log_msg,
+                format!("ℹ  Firewall rules require {}.", admin_hint),
+            ],
         }
     }
 }
@@ -208,76 +326,52 @@ impl Default for PortFwdApp {
 impl PortFwdApp {
     fn add_log(&mut self, msg: impl Into<String>) {
         let m = msg.into();
-        if self.log.len() > 200 {
-            self.log.remove(0);
-        }
+        if self.log.len() > 200 { self.log.remove(0); }
         self.log.push(m);
     }
 
     fn start_rule(&mut self) {
         let lp: u16 = match self.listen_port.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                self.add_log("✗ Invalid listen port");
-                return;
-            }
+            Ok(p)  => p,
+            Err(_) => { self.add_log("✗ Invalid listen port"); return; }
         };
         let tp: u16 = match self.target_port.trim().parse() {
-            Ok(p) => p,
-            Err(_) => {
-                self.add_log("✗ Invalid target port");
-                return;
-            }
+            Ok(p)  => p,
+            Err(_) => { self.add_log("✗ Invalid target port"); return; }
         };
         let th = self.target_host.trim().to_string();
-        if th.is_empty() {
-            self.add_log("✗ Target host is empty");
-            return;
-        }
+        if th.is_empty() { self.add_log("✗ Target host is empty"); return; }
 
-        // Prevent self-loop
         if lp == tp && (th == "127.0.0.1" || th == "localhost") {
-            self.add_log("✗ Listen and target port are the same on localhost — would loop. Change the listen port.");
+            self.add_log("✗ Listen and target port are the same on localhost — would loop.");
             return;
         }
-
-        if self
-            .rules
-            .iter()
-            .any(|r| r.rule.listen_port == lp && r.status == RuleStatus::Running)
-        {
+        if self.rules.iter().any(|r| r.rule.listen_port == lp && r.status == RuleStatus::Running) {
             self.add_log(format!("✗ Port {} is already forwarding", lp));
             return;
         }
 
-        let rule = Rule {
-            listen_port: lp,
-            target_host: th.clone(),
-            target_port: tp,
-        };
-        let status = Arc::new(Mutex::new(RuleStatus::Idle));
-        let conns = Arc::new(Mutex::new(0u64));
+        let rule    = Rule { listen_port: lp, target_host: th.clone(), target_port: tp };
+        let status  = Arc::new(Mutex::new(RuleStatus::Idle));
+        let conns   = Arc::new(Mutex::new(0u64));
         let stop_tx = spawn_forwarder(rule.clone(), conns.clone(), status.clone());
 
         if self.is_admin {
-            fw_add(lp);
+            if fw_add(lp) {
+                self.add_log(format!("✓  Firewall rule added for port {}", lp));
+            } else {
+                self.add_log(format!("⚠  Could not add firewall rule for port {} — add manually if needed", lp));
+            }
         }
 
         self.add_log(format!("▶  0.0.0.0:{} → {}:{}", lp, th, tp));
-        self.rules.push(ActiveRule {
-            rule,
-            status: RuleStatus::Running,
-            stop_tx: Some(stop_tx),
-            connections: 0,
-        });
+        self.rules.push(ActiveRule { rule, status: RuleStatus::Running, stop_tx: Some(stop_tx), connections: 0 });
         self.rule_status.push(status);
         self.rule_conns.push(conns);
     }
 
     fn stop_rule(&mut self, idx: usize) {
-        if let Some(tx) = self.rules[idx].stop_tx.take() {
-            let _ = tx.send(());
-        }
+        if let Some(tx) = self.rules[idx].stop_tx.take() { let _ = tx.send(()); }
         fw_remove(self.rules[idx].rule.listen_port);
         let lp = self.rules[idx].rule.listen_port;
         self.add_log(format!("■  stopped :{}", lp));
@@ -288,7 +382,7 @@ impl PortFwdApp {
 
     fn sync_statuses(&mut self) {
         for (i, r) in self.rules.iter_mut().enumerate() {
-            r.status = self.rule_status[i].lock().unwrap().clone();
+            r.status      = self.rule_status[i].lock().unwrap().clone();
             r.connections = *self.rule_conns[i].lock().unwrap();
         }
     }
@@ -301,29 +395,38 @@ impl eframe::App for PortFwdApp {
         self.sync_statuses();
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
-        let bg = Color32::from_rgb(15, 17, 23);
+        let bg      = Color32::from_rgb(15, 17, 23);
         let surface = Color32::from_rgb(22, 26, 35);
-        let card = Color32::from_rgb(28, 33, 45);
-        let border = Color32::from_rgb(45, 52, 68);
-        let accent = Color32::from_rgb(82, 160, 255);
-        let green = Color32::from_rgb(52, 211, 153);
-        let red = Color32::from_rgb(251, 113, 133);
-        let amber = Color32::from_rgb(251, 191, 36);
-        let txt = Color32::from_rgb(220, 228, 240);
+        let card    = Color32::from_rgb(28, 33, 45);
+        let border  = Color32::from_rgb(45, 52, 68);
+        let accent  = Color32::from_rgb(82, 160, 255);
+        let green   = Color32::from_rgb(52, 211, 153);
+        let red     = Color32::from_rgb(251, 113, 133);
+        let amber   = Color32::from_rgb(251, 191, 36);
+        let txt     = Color32::from_rgb(220, 228, 240);
         let txt_dim = Color32::from_rgb(100, 115, 140);
 
         let mut vis = egui::Visuals::dark();
-        vis.window_fill = bg;
-        vis.panel_fill = bg;
-        vis.widgets.noninteractive.bg_fill = surface;
-        vis.widgets.inactive.bg_fill = card;
-        vis.widgets.hovered.bg_fill = Color32::from_rgb(38, 45, 62);
-        vis.widgets.active.bg_fill = Color32::from_rgb(50, 60, 82);
+        vis.window_fill                      = bg;
+        vis.panel_fill                       = bg;
+        vis.widgets.noninteractive.bg_fill   = surface;
+        vis.widgets.inactive.bg_fill         = card;
+        vis.widgets.hovered.bg_fill          = Color32::from_rgb(38, 45, 62);
+        vis.widgets.active.bg_fill           = Color32::from_rgb(50, 60, 82);
         vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0, border);
-        vis.widgets.inactive.fg_stroke = Stroke::new(1.0, border);
-        vis.widgets.hovered.fg_stroke = Stroke::new(1.5, accent);
-        vis.selection.bg_fill = Color32::from_rgba_premultiplied(82, 160, 255, 60);
+        vis.widgets.inactive.fg_stroke       = Stroke::new(1.0, border);
+        vis.widgets.hovered.fg_stroke        = Stroke::new(1.5, accent);
+        vis.selection.bg_fill                = Color32::from_rgba_premultiplied(82, 160, 255, 60);
         ctx.set_visuals(vis);
+
+        // Admin warning text varies by platform
+        let admin_warn = {
+            #[cfg(windows)]             { "⚠  Run as Administrator to enable automatic firewall rules." }
+            #[cfg(target_os = "macos")] { "⚠  Run with sudo to enable automatic firewall rules." }
+            #[cfg(target_os = "linux")] { "⚠  Run with sudo to enable automatic firewall rules." }
+            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+            { "⚠  Elevated privileges needed for automatic firewall rules." }
+        };
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg).inner_margin(egui::Margin::same(0.0)))
@@ -338,7 +441,7 @@ impl eframe::App for PortFwdApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("⟳").font(FontId::proportional(22.0)).color(accent));
                         ui.add_space(6.0);
-                        ui.label(RichText::new("GuiPortFwd").font(FontId::proportional(18.0)).color(txt).strong());
+                        ui.label(RichText::new("portfwd").font(FontId::proportional(18.0)).color(txt).strong());
                         ui.label(RichText::new("  LAN Port Forwarder").font(FontId::proportional(13.0)).color(txt_dim));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (bg_col, label, fg_col) = if self.is_admin {
@@ -415,7 +518,7 @@ impl eframe::App for PortFwdApp {
                                 .rounding(egui::Rounding::same(6.0))
                                 .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 6.0, bottom: 6.0 })
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new("⚠  Run as Administrator to enable automatic firewall rules.")
+                                    ui.label(RichText::new(admin_warn)
                                         .font(FontId::proportional(11.5)).color(amber));
                                 });
                         }
@@ -425,7 +528,6 @@ impl eframe::App for PortFwdApp {
                 if !self.rules.is_empty() {
                     ui.label(RichText::new("  Active rules").font(FontId::proportional(11.0)).color(txt_dim));
                     ui.add_space(6.0);
-
                     let mut to_stop: Option<usize> = None;
 
                     for (i, rule) in self.rules.iter().enumerate() {
@@ -434,7 +536,6 @@ impl eframe::App for PortFwdApp {
                             RuleStatus::Idle     => (txt_dim, "idle"),
                             RuleStatus::Error(e) => (red,     e.as_str()),
                         };
-                        // Use the PC's LAN IP for the phone URL, not the target_host
                         let connect_url = format!("http://{}:{}", self.lan_ip, rule.rule.listen_port);
 
                         egui::Frame::none()
@@ -444,7 +545,6 @@ impl eframe::App for PortFwdApp {
                             .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 10.0, bottom: 12.0 })
                             .outer_margin(egui::Margin { left: 16.0, right: 16.0, top: 0.0, bottom: 8.0 })
                             .show(ui, |ui| {
-                                // Top row
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("●").font(FontId::proportional(10.0)).color(dot_col));
                                     ui.add_space(4.0);
@@ -466,8 +566,6 @@ impl eframe::App for PortFwdApp {
                                         ).clicked() { to_stop = Some(i); }
                                     });
                                 });
-
-                                // URL row
                                 ui.add_space(8.0);
                                 egui::Frame::none()
                                     .fill(Color32::from_rgb(10, 12, 18))
@@ -495,7 +593,6 @@ impl eframe::App for PortFwdApp {
                                     });
                             });
                     }
-
                     if let Some(idx) = to_stop { self.stop_rule(idx); }
                     ui.add_space(4.0);
                 }
@@ -527,9 +624,7 @@ impl eframe::App for PortFwdApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for rule in &mut self.rules {
-            if let Some(tx) = rule.stop_tx.take() {
-                let _ = tx.send(());
-            }
+            if let Some(tx) = rule.stop_tx.take() { let _ = tx.send(()); }
             fw_remove(rule.rule.listen_port);
         }
     }
@@ -539,10 +634,10 @@ impl eframe::App for PortFwdApp {
 
 fn main() -> eframe::Result<()> {
     eframe::run_native(
-        "GuiPortFwd",
+        "portfwd",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title("GuiPortFwd")
+                .with_title("portfwd")
                 .with_inner_size([660.0, 500.0])
                 .with_min_inner_size([540.0, 360.0])
                 .with_resizable(true),

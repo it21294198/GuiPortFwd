@@ -12,7 +12,17 @@ cargo run
 ```
 ```sh
 # If needed, the binary will be at target\release\portfwd.exe
+
+# Windows (in elevated terminal)
 cargo build --release
+
+# macOS
+cargo build --release
+sudo ./target/release/portfwd   # sudo for firewall rules
+
+# Linux
+cargo build --release
+sudo ./target/release/portfwd   # sudo for iptables
 ```
 #### Run the server (Eg:- for FastAPI server)
 ###### Any type of server is possible by setting IP to 127.0.0.1 and port to 8080
