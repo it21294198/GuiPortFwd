@@ -1,0 +1,37 @@
+[package]
+name = "PortForwader"
+version = "0.1.0"
+edition = "2021"
+
+# Hide the console window on Windows so only the GUI shows
+#[[bin]]
+#name = "portfwd"
+#path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+eframe = { version = "0.27", features = ["default"] }
+egui = "0.27"
+egui_extras = "0.27"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+# On Windows, hide the console window so only the GUI appears
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[[bin]]
+name = "portfwd"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
