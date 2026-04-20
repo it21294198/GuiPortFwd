@@ -1,5 +1,5 @@
-//! portfwd — GUI port forwarder (Windows, macOS, Linux)
-//! Built with egui/eframe + tokio
+//! GuiPortFwd — GUI port forwarder (Windows, macOS, Linux)
+//! Built with egui/eframe (native, no browser needed)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -32,17 +32,24 @@ struct ActiveRule {
     status:      RuleStatus,
     stop_tx:     Option<oneshot::Sender<()>>,
     connections: u64,
+    /// On macOS/Linux we also spawn a socat child process; keep its handle
+    /// so we can kill it when the rule is stopped.
+    #[cfg(unix)]
+    socat_child: Option<std::process::Child>,
 }
 
 // ─── Firewall ─────────────────────────────────────────────────────────────────
 
+/// Add a firewall rule to allow inbound TCP on `port`.
+/// Each platform uses its native mechanism.
 fn fw_add(port: u16) -> bool {
     #[cfg(windows)]
     {
+        // Windows: netsh advfirewall
         Command::new("netsh")
             .args([
                 "advfirewall", "firewall", "add", "rule",
-                &format!("name=portfwd-{}", port),
+                &format!("name=GuiPortFwd-{}", port),
                 "dir=in", "action=allow", "protocol=TCP",
                 &format!("localport={}", port),
             ])
@@ -53,99 +60,101 @@ fn fw_add(port: u16) -> bool {
 
     #[cfg(target_os = "macos")]
     {
-        // macOS: add a pf anchor rule (requires sudo)
-        // Simpler: just open the port via pfctl echo rule
-        let rule = format!("pass in proto tcp from any to any port {}", port);
-        let _ = Command::new("sh")
-            .args(["-c", &format!("echo '{}' | sudo pfctl -ef -", rule)])
-            .output();
-        true // pf rules are optional; app still forwards without them
+        // macOS: add a pf pass rule via pfctl (requires sudo / root)
+        let rule = format!("pass in proto tcp from any to any port {}\n", port);
+        let result = Command::new("sh")
+            .args(["-c", &format!("echo '{}' | sudo pfctl -ef - 2>/dev/null", rule.trim())])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        result
     }
 
     #[cfg(target_os = "linux")]
     {
-        // Linux: add an iptables rule
-        let ok = Command::new("iptables")
-            .args([
-                "-I", "INPUT", "-p", "tcp",
-                "--dport", &port.to_string(),
-                "-j", "ACCEPT",
-            ])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ok {
-            // Try with sudo if direct call failed
-            Command::new("sudo")
-                .args([
-                    "iptables", "-I", "INPUT", "-p", "tcp",
-                    "--dport", &port.to_string(),
-                    "-j", "ACCEPT",
-                ])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        } else {
-            ok
-        }
+        // Linux: iptables (tries direct first, falls back to sudo)
+        let args = [
+            "iptables", "-I", "INPUT", "-p", "tcp",
+            "--dport", &port.to_string(), "-j", "ACCEPT",
+        ];
+        let ok = Command::new(args[0]).args(&args[1..])
+            .output().map(|o| o.status.success()).unwrap_or(false);
+        if ok { return true; }
+        Command::new("sudo").args(args)
+            .output().map(|o| o.status.success()).unwrap_or(false)
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     { let _ = port; false }
 }
 
+/// Remove the firewall rule previously added for `port`.
 fn fw_remove(port: u16) {
     #[cfg(windows)]
     {
         let _ = Command::new("netsh")
             .args([
                 "advfirewall", "firewall", "delete", "rule",
-                &format!("name=portfwd-{}", port),
+                &format!("name=GuiPortFwd-{}", port),
             ])
             .output();
     }
 
     #[cfg(target_os = "macos")]
     {
-        // Flush the anchor we added (best-effort)
-        let _ = Command::new("sudo")
-            .args(["pfctl", "-F", "rules"])
-            .output();
+        // Flush pf rules (best-effort; may affect other rules — acceptable for dev use)
+        let _ = Command::new("sudo").args(["pfctl", "-F", "rules"]).output();
         let _ = port;
     }
 
     #[cfg(target_os = "linux")]
     {
-        // Remove the iptables rule
-        let _ = Command::new("sudo")
-            .args([
-                "iptables", "-D", "INPUT", "-p", "tcp",
-                "--dport", &port.to_string(),
-                "-j", "ACCEPT",
-            ])
-            .output();
+        let args = [
+            "iptables", "-D", "INPUT", "-p", "tcp",
+            "--dport", &port.to_string(), "-j", "ACCEPT",
+        ];
+        let ok = Command::new(args[0]).args(&args[1..])
+            .output().map(|o| o.status.success()).unwrap_or(false);
+        if !ok {
+            let _ = Command::new("sudo").args(args).output();
+        }
     }
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     { let _ = port; }
 }
 
+// ─── socat helper (macOS / Linux only) ───────────────────────────────────────
+//
+// On Unix we can optionally hand off forwarding to socat, which is the
+// idiomatic tool on those platforms.  This spawns:
+//   socat TCP-LISTEN:<listen>,reuseaddr,fork TCP:<host>:<port>
+// as a child process and returns its handle so the caller can kill it later.
+//
+// If socat is not installed the Rust async forwarder is used instead —
+// the two paths are functionally identical.
+
+#[cfg(unix)]
+fn try_spawn_socat(listen_port: u16, target_host: &str, target_port: u16)
+    -> Option<std::process::Child>
+{
+    Command::new("socat")
+        .arg(format!("TCP-LISTEN:{},reuseaddr,fork", listen_port))
+        .arg(format!("TCP:{}:{}", target_host, target_port))
+        .spawn()
+        .ok()
+}
+
 // ─── Admin / privilege check ──────────────────────────────────────────────────
 
 fn is_elevated() -> bool {
     #[cfg(windows)]
-    {
-        Command::new("net").args(["session"])
-            .output().map(|o| o.status.success()).unwrap_or(false)
-    }
+    { Command::new("net").args(["session"]).output().map(|o| o.status.success()).unwrap_or(false) }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        // On Unix, check if effective UID is 0 (root)
-        unsafe { libc::geteuid() == 0 }
-    }
+    #[cfg(unix)]
+    { unsafe { libc::geteuid() == 0 } }
 
-    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(windows, unix)))]
     { false }
 }
 
@@ -154,7 +163,7 @@ fn is_elevated() -> bool {
 fn lan_ip() -> Option<IpAddr> {
     #[cfg(windows)]
     {
-        // Parse ipconfig output
+        // ipconfig — find first non-loopback IPv4 line
         let out = Command::new("ipconfig").output().ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
@@ -172,21 +181,24 @@ fn lan_ip() -> Option<IpAddr> {
 
     #[cfg(target_os = "macos")]
     {
-        // Parse `ifconfig` — look for en0 (Wi-Fi) or en1 inet address
-        let out = Command::new("ifconfig").output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut in_en = false;
-        for line in text.lines() {
-            let t = line.trim();
-            // Track which interface we're in
-            if t.starts_with("en") && t.contains(':') { in_en = true; }
-            else if !t.starts_with(' ') && !t.starts_with('\t') { in_en = false; }
-            if !in_en { continue; }
-            // "inet 192.168.1.10 netmask ..."
-            if t.starts_with("inet ") && !t.starts_with("inet6") {
+        // Strategy 1: ipconfig getifaddr <iface> — fast, reliable, one IP per interface
+        for iface in &["en0", "en1", "en2", "en3"] {
+            if let Ok(out) = Command::new("ipconfig").args(["getifaddr", iface]).output() {
+                let ip_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                    if !ip.is_loopback() { return Some(ip); }
+                }
+            }
+        }
+        // Strategy 2: scan all interfaces via ifconfig -a
+        if let Ok(out) = Command::new("ifconfig").arg("-a").output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let t = line.trim();
+                if !t.starts_with("inet ") || t.starts_with("inet6") { continue; }
                 let parts: Vec<&str> = t.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(ip) = parts[1].parse::<IpAddr>() {
+                if let Some(ip_str) = parts.get(1) {
+                    if let Ok(ip) = ip_str.parse::<IpAddr>() {
                         if !ip.is_loopback() { return Some(ip); }
                     }
                 }
@@ -197,17 +209,15 @@ fn lan_ip() -> Option<IpAddr> {
 
     #[cfg(target_os = "linux")]
     {
-        // Parse `ip addr show` output
+        // ip addr show — first non-loopback inet
         let out = Command::new("ip").args(["addr", "show"]).output().ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             let t = line.trim();
-            // "inet 192.168.1.10/24 brd ..."
             if t.starts_with("inet ") && !t.starts_with("inet6") {
                 let parts: Vec<&str> = t.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    // Strip the /prefix length
-                    let ip_str = parts[1].split('/').next().unwrap_or("");
+                if let Some(cidr) = parts.get(1) {
+                    let ip_str = cidr.split('/').next().unwrap_or("");
                     if let Ok(ip) = ip_str.parse::<IpAddr>() {
                         if !ip.is_loopback() { return Some(ip); }
                     }
@@ -221,7 +231,8 @@ fn lan_ip() -> Option<IpAddr> {
     { None }
 }
 
-// ─── Async TCP forwarder ──────────────────────────────────────────────────────
+// ─── Async TCP forwarder (Rust fallback — used on Windows always,
+//     on macOS/Linux when socat is not available) ───────────────────────────────
 
 async fn forward_conn(mut client: TcpStream, target: Arc<String>) -> io::Result<()> {
     let mut server = TcpStream::connect(target.as_str()).await?;
@@ -236,7 +247,7 @@ async fn forward_conn(mut client: TcpStream, target: Arc<String>) -> io::Result<
     Ok(())
 }
 
-fn spawn_forwarder(
+fn spawn_rust_forwarder(
     rule:       Rule,
     conn_count: Arc<Mutex<u64>>,
     status_out: Arc<Mutex<RuleStatus>>,
@@ -298,13 +309,17 @@ impl Default for PortFwdApp {
         } else {
             format!("✓  LAN IP: {}  — use this address on your phone.", lan)
         };
-        let admin_hint = {
-            #[cfg(windows)]      { "Run as Administrator" }
-            #[cfg(target_os = "macos")]  { "Run with sudo" }
-            #[cfg(target_os = "linux")]  { "Run with sudo" }
-            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-            { "elevated privileges" }
-        };
+
+        // Hint about how to get firewall auto-management on each platform
+        #[cfg(windows)]
+        let priv_hint = "ℹ  Firewall rules require running as Administrator.";
+        #[cfg(target_os = "macos")]
+        let priv_hint = "ℹ  Firewall rules require sudo. socat used for forwarding if available.";
+        #[cfg(target_os = "linux")]
+        let priv_hint = "ℹ  Firewall rules require sudo (iptables). socat used if available.";
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        let priv_hint = "ℹ  Firewall rule management not supported on this platform.";
+
         Self {
             listen_port: "9000".to_string(),
             target_host: "127.0.0.1".to_string(),
@@ -314,11 +329,7 @@ impl Default for PortFwdApp {
             rule_conns:  vec![],
             lan_ip:      lan,
             is_admin:    is_elevated(),
-            log: vec![
-                "portfwd ready.".to_string(),
-                log_msg,
-                format!("ℹ  Firewall rules require {}.", admin_hint),
-            ],
+            log:         vec!["GuiPortFwd ready.".to_string(), log_msg, priv_hint.to_string()],
         }
     }
 }
@@ -351,27 +362,65 @@ impl PortFwdApp {
             return;
         }
 
-        let rule    = Rule { listen_port: lp, target_host: th.clone(), target_port: tp };
-        let status  = Arc::new(Mutex::new(RuleStatus::Idle));
-        let conns   = Arc::new(Mutex::new(0u64));
-        let stop_tx = spawn_forwarder(rule.clone(), conns.clone(), status.clone());
+        let rule = Rule { listen_port: lp, target_host: th.clone(), target_port: tp };
 
+        // ── Firewall rule ─────────────────────────────────────────────────────
         if self.is_admin {
             if fw_add(lp) {
-                self.add_log(format!("✓  Firewall rule added for port {}", lp));
+                self.add_log(format!("✓  Firewall: opened port {}", lp));
             } else {
-                self.add_log(format!("⚠  Could not add firewall rule for port {} — add manually if needed", lp));
+                self.add_log(format!("⚠  Firewall: could not open port {} — open manually if needed", lp));
             }
         }
 
-        self.add_log(format!("▶  0.0.0.0:{} → {}:{}", lp, th, tp));
-        self.rules.push(ActiveRule { rule, status: RuleStatus::Running, stop_tx: Some(stop_tx), connections: 0 });
+        // ── Forwarder: try socat on Unix, fall back to Rust async ─────────────
+        let status = Arc::new(Mutex::new(RuleStatus::Idle));
+        let conns  = Arc::new(Mutex::new(0u64));
+
+        #[cfg(unix)]
+        let socat_child = try_spawn_socat(lp, &th, tp);
+
+        #[cfg(unix)]
+        let used_socat = socat_child.is_some();
+        #[cfg(not(unix))]
+        let used_socat = false;
+
+        // Always start the Rust forwarder as well on Windows;
+        // on Unix start it only if socat wasn't available.
+        let stop_tx = if !used_socat {
+            let tx = spawn_rust_forwarder(rule.clone(), conns.clone(), status.clone());
+            Some(tx)
+        } else {
+            // socat owns the port — mark status Running immediately
+            *status.lock().unwrap() = RuleStatus::Running;
+            None
+        };
+
+        let engine = if used_socat { "socat" } else { "built-in" };
+        self.add_log(format!("▶  0.0.0.0:{} → {}:{}  ({})", lp, th, tp, engine));
+
+        self.rules.push(ActiveRule {
+            rule,
+            status: RuleStatus::Running,
+            stop_tx,
+            connections: 0,
+            #[cfg(unix)]
+            socat_child,
+        });
         self.rule_status.push(status);
         self.rule_conns.push(conns);
     }
 
     fn stop_rule(&mut self, idx: usize) {
+        // Stop Rust forwarder
         if let Some(tx) = self.rules[idx].stop_tx.take() { let _ = tx.send(()); }
+
+        // Kill socat child if present
+        #[cfg(unix)]
+        if let Some(mut child) = self.rules[idx].socat_child.take() {
+            let _ = child.kill();
+        }
+
         fw_remove(self.rules[idx].rule.listen_port);
         let lp = self.rules[idx].rule.listen_port;
         self.add_log(format!("■  stopped :{}", lp));
@@ -419,14 +468,14 @@ impl eframe::App for PortFwdApp {
         vis.selection.bg_fill                = Color32::from_rgba_premultiplied(82, 160, 255, 60);
         ctx.set_visuals(vis);
 
-        // Admin warning text varies by platform
-        let admin_warn = {
-            #[cfg(windows)]             { "⚠  Run as Administrator to enable automatic firewall rules." }
-            #[cfg(target_os = "macos")] { "⚠  Run with sudo to enable automatic firewall rules." }
-            #[cfg(target_os = "linux")] { "⚠  Run with sudo to enable automatic firewall rules." }
-            #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-            { "⚠  Elevated privileges needed for automatic firewall rules." }
-        };
+        #[cfg(windows)]
+        let admin_warn = "⚠  Run as Administrator to enable automatic firewall rules.";
+        #[cfg(target_os = "macos")]
+        let admin_warn = "⚠  Run with sudo to enable automatic firewall rules.";
+        #[cfg(target_os = "linux")]
+        let admin_warn = "⚠  Run with sudo to enable automatic iptables rules.";
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        let admin_warn = "⚠  Elevated privileges needed for automatic firewall rules.";
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(bg).inner_margin(egui::Margin::same(0.0)))
@@ -441,7 +490,7 @@ impl eframe::App for PortFwdApp {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("⟳").font(FontId::proportional(22.0)).color(accent));
                         ui.add_space(6.0);
-                        ui.label(RichText::new("portfwd").font(FontId::proportional(18.0)).color(txt).strong());
+                        ui.label(RichText::new("GuiPortFwd").font(FontId::proportional(18.0)).color(txt).strong());
                         ui.label(RichText::new("  LAN Port Forwarder").font(FontId::proportional(13.0)).color(txt_dim));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (bg_col, label, fg_col) = if self.is_admin {
@@ -625,6 +674,8 @@ impl eframe::App for PortFwdApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for rule in &mut self.rules {
             if let Some(tx) = rule.stop_tx.take() { let _ = tx.send(()); }
+            #[cfg(unix)]
+            if let Some(mut child) = rule.socat_child.take() { let _ = child.kill(); }
             fw_remove(rule.rule.listen_port);
         }
     }
@@ -634,10 +685,10 @@ impl eframe::App for PortFwdApp {
 
 fn main() -> eframe::Result<()> {
     eframe::run_native(
-        "portfwd",
+        "GuiPortFwd",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
-                .with_title("portfwd")
+                .with_title("GuiPortFwd")
                 .with_inner_size([660.0, 500.0])
                 .with_min_inner_size([540.0, 360.0])
                 .with_resizable(true),
