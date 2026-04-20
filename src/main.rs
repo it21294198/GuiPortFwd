@@ -643,6 +643,6 @@ fn main() -> eframe::Result<()> {
                 .with_resizable(true),
             ..Default::default()
         },
-        Box::new(|_cc| Box::new(PortFwdApp::default())),
+        Box::new(|_cc| Ok(Box::new(PortFwdApp::default()))),
     )
 }
