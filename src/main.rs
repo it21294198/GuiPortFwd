@@ -321,7 +321,7 @@ impl Default for PortFwdApp {
         let priv_hint = "ℹ  Firewall rule management not supported on this platform.";
 
         Self {
-            listen_port: "9000".to_string(),
+            listen_port: "8000".to_string(),
             target_host: "127.0.0.1".to_string(),
             target_port: "8080".to_string(),
             rules:       vec![],
