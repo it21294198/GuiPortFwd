@@ -397,7 +397,7 @@ impl PortFwdApp {
         };
 
         let engine = if used_socat { "socat" } else { "built-in" };
-        self.add_log(format!("▶  0.0.0.0:{} → {}:{}  ({})", lp, th, tp, engine));
+        self.add_log(format!("▶  127.0.0.1:{} → {}:{}  ({})", lp, th, tp, engine));
 
         self.rules.push(ActiveRule {
             rule,
@@ -598,8 +598,8 @@ impl eframe::App for PortFwdApp {
                                     ui.label(RichText::new("●").font(FontId::proportional(10.0)).color(dot_col));
                                     ui.add_space(4.0);
                                     ui.label(RichText::new(format!(
-                                        "0.0.0.0:{} → {}:{}",
-                                        rule.rule.listen_port, rule.rule.target_host, rule.rule.target_port,
+                                        "127.0.0.1:{} → {}:{}",
+                                        rule.rule.target_port, self.lan_ip, rule.rule.listen_port,
                                     )).font(FontId::monospace(13.0)).color(txt));
                                     ui.add_space(10.0);
                                     ui.label(RichText::new(status_txt).font(FontId::proportional(11.0)).color(dot_col));
